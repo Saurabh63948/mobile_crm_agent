@@ -259,6 +259,27 @@ def items_key_for_type(typ: str) -> str:
             "deal": "deals", "company": "companies"}.get(typ, "contacts")
 
 
+def build_disambig_choices(matches, limit: int = 5):
+    """
+    Build a consistent 'which one do you mean' choice list for any set of
+    matched records, regardless of module (lead/contact/deal/company).
+    Each label: Name — Company (Stage) | email | phone
+    """
+    choices = []
+    for _, item in matches[:limit]:
+        label = get_name(item)
+        company = get_company(item)
+        stage = get_stage(item)
+        if company:
+            label += f" — {company}"
+        if stage:
+            label += f" ({stage})"
+        label += f" | {get_email(item) or 'no email'}"
+        label += f" | {get_phone(item) or 'no phone'}"
+        choices.append(label)
+    return choices
+
+
 # ─── Ordinal helpers ──────────────────────────────────────────────────────────
 ORDINAL_MAP = {
     "first": 0, "1st": 0, "pehla": 0, "pehle": 0, "pehli": 0, "ek": 0, "1": 0,
@@ -424,7 +445,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
     if phone_filter_match:
         phone_q = re.sub(r'\D', '', phone_filter_match.group(1))
         matches = find_by_phone(phone_q, all_items)
-        if matches:
+        if len(matches) == 1:
             typ, item = matches[0]
             details = get_full_details_text(item, typ)
             return ChatResponse(
@@ -432,6 +453,13 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                 action=action_for_type(typ),
                 items=[item],
                 item_type=typ,
+            )
+        elif len(matches) > 1:
+            disambig_choices = build_disambig_choices(matches)
+            return ChatResponse(
+                reply=f"I found **{len(matches)}** records with phone **{get_phone(matches[0][1])}**. Which one do you mean?",
+                action="TALK",
+                choices=disambig_choices,
             )
         return ChatResponse(reply=f"No record found with phone number containing **{phone_q}**.", action="TALK")
 
@@ -441,7 +469,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
     if email_filter_match and not re.search(r'\b(call|dial|ring)\b', lower):
         email_q = email_filter_match.group(1).strip()
         matches = find_by_email(email_q, all_items)
-        if matches:
+        if len(matches) == 1:
             typ, item = matches[0]
             details = get_full_details_text(item, typ)
             return ChatResponse(
@@ -449,6 +477,13 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                 action=action_for_type(typ),
                 items=[item],
                 item_type=typ,
+            )
+        elif len(matches) > 1:
+            disambig_choices = build_disambig_choices(matches)
+            return ChatResponse(
+                reply=f"I found **{len(matches)}** records with email **{email_q}**. Which one do you mean?",
+                action="TALK",
+                choices=disambig_choices,
             )
         return ChatResponse(reply=f"No record found with email **{email_q}**.", action="TALK")
 
