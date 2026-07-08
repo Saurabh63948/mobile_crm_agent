@@ -438,7 +438,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
     # ── 2. Find by email ──────────────────────────────────────────────────────
     # e.g. "give the deal where email is abc@gmail.com"
     email_filter_match = re.search(r'(?:email|mail)\s+(?:is|=|:)?\s*([\w\.\-]+@[\w\.\-]+)', lower)
-    if email_filter_match:
+    if email_filter_match and not re.search(r'\b(call|dial|ring)\b', lower):
         email_q = email_filter_match.group(1).strip()
         matches = find_by_email(email_q, all_items)
         if matches:
@@ -780,11 +780,34 @@ def handle_call_from_stored_results(user_msg: str, user_id: str, sessions: dict)
 
     all_items, _ = all_items_from_session(user_id, sessions)
 
+    # ── PRIORITY 0: an email address is explicitly given in the call request,
+    # e.g. "call saurabh with email saurabh123mahi@gmail.com" — match on that
+    # email directly instead of trying (and possibly failing) to parse a name.
+    email_in_msg = re.search(r'[\w\.\-]+@[\w\.\-]+', lower)
+    if email_in_msg:
+        matches = find_by_email(email_in_msg.group(0), all_items)
+        if len(matches) == 1:
+            typ, item = matches[0]
+            phone = get_phone(item)
+            name = get_name(item)
+            if phone:
+                sessions.setdefault(user_id, {})["last_call_made"] = {"name": name, "phone": phone}
+                sessions.setdefault(user_id, {})["last_shown_item"] = (typ, item)
+                return ChatResponse(reply=f"📞 Calling {name} at {phone}...",
+                                    action="MAKE_CALL", data={"phone": phone, "name": name})
+            return ChatResponse(reply=f"{name} has no phone number saved.", action="TALK")
+        elif len(matches) > 1:
+            choices = [f"{get_name(i)} — {get_phone(i) or 'no phone'}" for _, i in matches[:5]]
+            return ChatResponse(reply="Multiple records share that email. Which one should I call?",
+                                action="TALK", choices=choices)
+        else:
+            return ChatResponse(reply=f"No record found with email **{email_in_msg.group(0)}** to call.", action="TALK")
+
     name_match = re.search(r'(?:call|dial|phone|ring)\s+(?:on\s+)?(?:this\s+)?(.+?)(?:\?|$)', lower)
 
     if name_match:
         name_q = name_match.group(1).strip()
-        name_q = re.sub(r'\b(on|this|the|number|please|ko|use|wala)\b', '', name_q).strip()
+        name_q = re.sub(r'\b(on|this|the|number|please|ko|use|wala|with|email|to)\b', '', name_q).strip()
 
         ord_check = re.search(r'\b(' + '|'.join(ORDINAL_MAP.keys()) + r')\b', name_q)
         if ord_check or name_q in ORDINAL_MAP:
@@ -818,7 +841,11 @@ def handle_call_from_stored_results(user_msg: str, user_id: str, sessions: dict)
                                     action="TALK", choices=choices)
 
     if all_items:
-        typ, item = all_items[0]
+        last_shown = sessions.get(user_id, {}).get("last_shown_item")
+        if last_shown:
+            typ, item = last_shown
+        else:
+            typ, item = all_items[0]
         phone = get_phone(item)
         name = get_name(item)
         if phone:
@@ -892,6 +919,8 @@ async def chat(req: ChatRequest):
 
     search_answer = answer_from_search_results(user_msg, user_id, sessions)
     if search_answer:
+        if search_answer.items and len(search_answer.items) == 1 and search_answer.item_type:
+            sessions.setdefault(user_id, {})["last_shown_item"] = (search_answer.item_type, search_answer.items[0])
         return search_answer
 
     call_response = handle_call_from_stored_results(user_msg, user_id, sessions)
