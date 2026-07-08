@@ -8,7 +8,7 @@ def query_hf(prompt: str) -> str:
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 200,
+            "max_new_tokens": 350,
             "temperature": 0.1,
             "return_full_text": False
         }
