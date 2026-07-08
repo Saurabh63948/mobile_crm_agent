@@ -9,7 +9,7 @@ def query_hf(prompt: str) -> str:
         "inputs": prompt,
         "parameters": {
             "max_new_tokens": 200,
-            "temperature": 0.7,
+            "temperature": 0.1,
             "return_full_text": False
         }
     }
