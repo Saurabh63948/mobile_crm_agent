@@ -220,6 +220,25 @@ def find_by_phone(phone_query: str, all_items):
             matches.append((typ, item))
     return matches
 
+def find_by_name_exclusive(query: str, all_items, exclude_name: str = None):
+    """
+    Find items by name, optionally excluding a specific name.
+    Also filters ALL items to only those matching the query when 'only' is used.
+    """
+    matches = find_by_name(query, all_items)
+    if exclude_name:
+        matches = [(t, i) for t, i in matches if not fuzzy_match(exclude_name, get_name(i))]
+    return matches
+
+def extract_exclusion(lower: str):
+    """
+    Detect patterns like 'not sara singh', 'except sara khan', 'only sara singh not sara khan'.
+    Returns (include_query, exclude_name).
+    """
+    excl = re.search(r'\b(?:not|except|excluding|sirf nahi|nahi)\s+([a-z\s]+?)(?:\?|$|,|\band\b)', lower)
+    excl_name = excl.group(1).strip() if excl else None
+    return excl_name
+
 def find_by_email(email_query: str, all_items):
     """Find items whose email matches (case-insensitive)."""
     eq = email_query.lower().strip()
@@ -250,6 +269,75 @@ ORDINAL_MAP = {
 }
 
 
+# ─── Disambig choice parser ───────────────────────────────────────────────────
+def parse_disambig_choice(user_msg: str, all_items):
+    """
+    When user selects a disambig choice like:
+      "sara singh — Free Fire (Enquiry1) | saurabh@gmail.com"
+    Extract name + stage/company/email and find the exact matching item.
+    Returns (typ, item) or None.
+    """
+    lower = user_msg.strip()
+
+    # Extract name (before ' — ' or ' | ')
+    name_part = re.split(r'\s*[—|]\s*', lower)[0].strip()
+    name_part = name_part.lower()
+
+    # Extract stage hint like (Won1) or (Enquiry1)
+    stage_hint = None
+    stage_match = re.search(r'\(([^)]+)\)', lower)
+    if stage_match:
+        stage_hint = stage_match.group(1).lower().strip()
+
+    # Extract company hint (between — and ()  )
+    company_hint = None
+    company_match = re.search(r'—\s*([^(|]+)', lower)
+    if company_match:
+        company_hint = company_match.group(1).strip()
+
+    # Extract email hint (after |)
+    email_hint = None
+    email_match = re.search(r'\|\s*([\w\.\-]+@[\w\.\-]+)', lower)
+    if email_match:
+        email_hint = email_match.group(1).strip()
+
+    candidates = [(t, i) for t, i in all_items if fuzzy_match(name_part, get_name(i).lower())]
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Narrow by stage hint first
+    if stage_hint:
+        stage_matches = [(t, i) for t, i in candidates
+                         if stage_hint in (get_stage(i) or "").lower()]
+        if len(stage_matches) == 1:
+            return stage_matches[0]
+        if stage_matches:
+            candidates = stage_matches
+
+    # Narrow by email hint
+    if email_hint:
+        email_matches = [(t, i) for t, i in candidates
+                         if email_hint in (get_email(i) or "").lower()]
+        if len(email_matches) == 1:
+            return email_matches[0]
+        if email_matches:
+            candidates = email_matches
+
+    # Narrow by company hint
+    if company_hint:
+        comp_matches = [(t, i) for t, i in candidates
+                        if company_hint in (get_company(i) or "").lower()]
+        if len(comp_matches) == 1:
+            return comp_matches[0]
+        if comp_matches:
+            candidates = comp_matches
+
+    return candidates[0] if candidates else None
+
+
 # ─── Main Q&A over stored results ─────────────────────────────────────────────
 def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> Optional[ChatResponse]:
     lower = user_msg.lower().strip()
@@ -257,6 +345,67 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
 
     if not all_items:
         return None
+
+    # ── STEP 0: Disambig choice selection ─────────────────────────────────────
+    # Detect if user sent a choice like "sara singh — Free Fire (Enquiry1) | email"
+    # Pattern: "name — company (stage) | email" — has at least one of — or |
+    if ('—' in user_msg or ('|' in user_msg and '@' in user_msg)) and len(user_msg) > 5:
+        result = parse_disambig_choice(user_msg, all_items)
+        if result:
+            typ, item = result
+            # Check if there's a pending field intent in session
+            pending = sessions.get(user_id, {}).pop("pending_field_intent", None)
+            if pending == "email":
+                e = get_email(item)
+                return ChatResponse(reply=f"{get_name(item)}'s email is **{e or 'not available'}**.", action="TALK")
+            elif pending == "phone":
+                p = get_phone(item)
+                return ChatResponse(reply=f"{get_name(item)}'s phone is **{p or 'not available'}**.", action="TALK")
+            elif pending == "budget":
+                b = get_budget_display(item)
+                return ChatResponse(reply=f"{get_name(item)}'s budget is **{b}**.", action="TALK")
+            else:
+                # Default: full detail card
+                details = get_full_details_text(item, typ)
+                return ChatResponse(
+                    reply=f"Here are full details for **{get_name(item)}**:\n{details}",
+                    action=action_for_type(typ),
+                    items=[item],
+                    item_type=typ,
+                )
+
+    # ── PRE-FILTER: exclusion ("not sara singh") ──────────────────────────────
+    excl_name = extract_exclusion(lower)
+
+    # ── PRE-FILTER: "only <name>" — narrow all_items to just that person ──────
+    only_match = re.search(r'\bonly\s+([a-z\s]{3,30?}?)(?:\s+(?:lead|contact|deal|company|ka|ki|ke|detail|email|phone|budget)|$|\?)', lower)
+    if only_match:
+        only_name = only_match.group(1).strip()
+        only_name = re.sub(r'\b(lead|contact|deal|company|of|the)\b', '', only_name).strip()
+        if only_name and len(only_name) > 2:
+            filtered = find_by_name(only_name, all_items)
+            if excl_name:
+                filtered = [(t, i) for t, i in filtered if not fuzzy_match(excl_name, get_name(i))]
+            if len(filtered) == 1:
+                all_items = filtered  # narrow down
+            elif len(filtered) > 1:
+                # Multiple exact-same-name records → disambiguate
+                disambig_choices = []
+                for t, i in filtered[:5]:
+                    email = get_email(i) or "no email"
+                    phone = get_phone(i) or "no phone"
+                    company = get_company(i) or ""
+                    stage = get_stage(i) or ""
+                    label = get_name(i)
+                    if company: label += f" — {company}"
+                    if stage: label += f" ({stage})"
+                    label += f" | {email}"
+                    disambig_choices.append(label)
+                return ChatResponse(
+                    reply=f"I found **{len(filtered)} records** for \"{only_name}\". Which one do you mean?",
+                    action="TALK",
+                    choices=disambig_choices,
+                )
 
     # ── 0. "show all" / "list all" ────────────────────────────────────────────
     if re.search(r"\b(show all|list all|sab dikhao|all results|sabhi)\b", lower):
@@ -373,6 +522,8 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
             name_q = re.sub(r'\b(of|the|this|lead|contact|deal|is|ki|ka|ke|wala|wali)\b', '', name_q).strip()
             if name_q and name_q not in ORDINAL_MAP and len(name_q) > 1:
                 matches = find_by_name(name_q, all_items)
+                if excl_name:
+                    matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
                 if len(matches) == 1:
                     typ, item = matches[0]
                     details = get_full_details_text(item, typ)
@@ -383,9 +534,21 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                         item_type=typ,
                     )
                 elif len(matches) > 1:
-                    choices = [f"{get_name(i)} ({t})" for t, i in matches[:5]]
-                    return ChatResponse(reply=f"Found {len(matches)} records. Which one?",
-                                        action="TALK", choices=choices)
+                    disambig_choices = []
+                    for t, i in matches[:5]:
+                        email = get_email(i) or "no email"
+                        company = get_company(i) or ""
+                        stage = get_stage(i) or ""
+                        label = get_name(i)
+                        if company: label += f" — {company}"
+                        if stage: label += f" ({stage})"
+                        label += f" | {email}"
+                        disambig_choices.append(label)
+                    return ChatResponse(
+                        reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                        action="TALK",
+                        choices=disambig_choices,
+                    )
         for typ, lst in search_results.items():
             if lst:
                 details_lines = []
@@ -406,11 +569,25 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
         name_q = re.sub(r'\b(of|the|is|ki|ka|ke|kya|batao)\b', '', name_q).strip()
         if name_q and len(name_q) > 1:
             matches = find_by_name(name_q, all_items)
-            if matches:
+            if excl_name:
+                matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
+            if len(matches) == 1:
                 typ, item = matches[0]
                 e = get_email(item)
                 return ChatResponse(reply=f"{get_name(item)}'s email is **{e or 'not available'}**.", action="TALK")
-            # No name match — show all emails
+            elif len(matches) > 1:
+                disambig_choices = []
+                for t, i in matches[:5]:
+                    company = get_company(i) or ""
+                    stage = get_stage(i) or ""
+                    label = get_name(i)
+                    if company: label += f" — {company}"
+                    if stage: label += f" ({stage})"
+                    label += f" | {get_phone(i) or 'no phone'}"
+                    disambig_choices.append(label)
+                sessions.setdefault(user_id, {})["pending_field_intent"] = "email"
+                return ChatResponse(reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                                    action="TALK", choices=disambig_choices)
             emails_list = [f"**{get_name(i)}**: {get_email(i) or 'not available'}" for _, i in all_items[:10]]
             return ChatResponse(reply="Here are all emails:\n" + "\n".join(emails_list), action="TALK")
 
@@ -422,11 +599,25 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
         name_q = re.sub(r'\b(of|the|is|ki|ka|ke|kya|batao|no)\b', '', name_q).strip()
         if name_q and name_q not in ORDINAL_MAP and len(name_q) > 1:
             matches = find_by_name(name_q, all_items)
-            if matches:
+            if excl_name:
+                matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
+            if len(matches) == 1:
                 typ, item = matches[0]
                 p = get_phone(item)
                 return ChatResponse(reply=f"{get_name(item)}'s phone is **{p or 'not available'}**.", action="TALK")
-            # No name match — show all phones
+            elif len(matches) > 1:
+                disambig_choices = []
+                for t, i in matches[:5]:
+                    company = get_company(i) or ""
+                    stage = get_stage(i) or ""
+                    label = get_name(i)
+                    if company: label += f" — {company}"
+                    if stage: label += f" ({stage})"
+                    label += f" | {get_email(i) or 'no email'}"
+                    disambig_choices.append(label)
+                sessions.setdefault(user_id, {})["pending_field_intent"] = "phone"
+                return ChatResponse(reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                                    action="TALK", choices=disambig_choices)
             phone_list = [f"**{get_name(i)}**: {get_phone(i) or 'not available'}" for _, i in all_items[:10]]
             return ChatResponse(reply="Here are all phone numbers:\n" + "\n".join(phone_list), action="TALK")
 
@@ -438,10 +629,24 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
         name_q = re.sub(r'\b(of|the|is|ki|ka|ke)\b', '', name_q).strip()
         if name_q and len(name_q) > 1:
             matches = find_by_name(name_q, all_items)
-            if matches:
+            if excl_name:
+                matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
+            if len(matches) == 1:
                 typ, item = matches[0]
                 c = get_company(item)
                 return ChatResponse(reply=f"{get_name(item)} works at **{c or 'not available'}**.", action="TALK")
+            elif len(matches) > 1:
+                disambig_choices = []
+                for t, i in matches[:5]:
+                    company = get_company(i) or ""
+                    stage = get_stage(i) or ""
+                    label = get_name(i)
+                    if company: label += f" — {company}"
+                    if stage: label += f" ({stage})"
+                    label += f" | {get_email(i) or 'no email'}"
+                    disambig_choices.append(label)
+                return ChatResponse(reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                                    action="TALK", choices=disambig_choices)
 
     # ── 9. Budget / revenue queries ───────────────────────────────────────────
     if re.search(r'\b(budget|revenue|amount|value|kitna|price|total budget|kitna budget)\b', lower):
@@ -452,10 +657,29 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
             name_q = re.sub(r'\b(of|the|is|ki|ka|ke)\b', '', name_q).strip()
             if name_q and name_q not in ORDINAL_MAP and len(name_q) > 1:
                 matches = find_by_name(name_q, all_items)
-                if matches:
+                if excl_name:
+                    matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
+                if len(matches) == 1:
                     typ, item = matches[0]
                     b = get_budget_display(item)
                     return ChatResponse(reply=f"{get_name(item)}'s total budget is **{b}**.", action="TALK")
+                elif len(matches) > 1:
+                    disambig_choices = []
+                    for t, i in matches[:5]:
+                        email = get_email(i) or "no email"
+                        company = get_company(i) or ""
+                        stage = get_stage(i) or ""
+                        label = get_name(i)
+                        if company: label += f" — {company}"
+                        if stage: label += f" ({stage})"
+                        label += f" | {email}"
+                        disambig_choices.append(label)
+                    sessions.setdefault(user_id, {})["pending_field_intent"] = "budget"
+                    return ChatResponse(
+                        reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                        action="TALK",
+                        choices=disambig_choices,
+                    )
         results = []
         for typ, item in all_items:
             name = get_name(item)
@@ -529,9 +753,21 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                 item_type=typ,
             )
         elif len(matches) > 1:
-            choices = [f"{get_name(i)} ({t})" for t, i in matches[:5]]
-            return ChatResponse(reply=f"Found {len(matches)} people matching. Which one?",
-                                action="TALK", choices=choices)
+            disambig_choices = []
+            for t, i in matches[:5]:
+                email = get_email(i) or "no email"
+                company = get_company(i) or ""
+                stage = get_stage(i) or ""
+                label = get_name(i)
+                if company: label += f" — {company}"
+                if stage: label += f" ({stage})"
+                label += f" | {email}"
+                disambig_choices.append(label)
+            return ChatResponse(
+                reply=f"Found **{len(matches)}** records named \"{lower.strip()}\". Which one?",
+                action="TALK",
+                choices=disambig_choices,
+            )
 
     return None
 
