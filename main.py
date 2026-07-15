@@ -186,6 +186,16 @@ def all_items_from_session(user_id, sessions):
     return items, search_results
 
 
+def group_by_type(all_items):
+    """Regroup a (possibly filter-narrowed) all_items list back into {type: [items]}.
+    Use this instead of the raw session `search_results` dict whenever a where-filter
+    may have narrowed the pool — reading search_results directly ignores the filter."""
+    grouped = {}
+    for typ, item in all_items:
+        grouped.setdefault(typ, []).append(item)
+    return grouped
+
+
 # ─── Fuzzy name matching ──────────────────────────────────────────────────────
 def fuzzy_match(query: str, target: str) -> bool:
     q = query.lower().strip()
@@ -249,6 +259,76 @@ def find_by_email(email_query: str, all_items):
             matches.append((typ, item))
     return matches
 
+def find_by_company(company_query: str, all_items):
+    """Find items whose company matches (case-insensitive, substring)."""
+    cq = company_query.lower().strip()
+    matches = []
+    for typ, item in all_items:
+        c = (get_company(item) or "").lower()
+        if cq and (cq in c or c in cq):
+            matches.append((typ, item))
+    return matches
+
+
+# ─── Generic 'where <field> is <value>' filter extraction ────────────────────
+# Lets any follow-up (call / details / budget / email of / phone of / ...)
+# be narrowed down by company, phone, or email in the SAME sentence, e.g.
+# "call saurabh where company is nits", "budget of saurabh where phone is 987...".
+def extract_where_filters(lower: str):
+    """
+    Scan the message for 'where company is X', 'company is X', 'where phone
+    is X', 'where email is X' clauses. Returns (filters_dict, remainder_text)
+    where remainder_text has those clauses stripped out, so the rest of the
+    message can still be parsed cleanly for a name / action.
+    """
+    filters = {}
+    remainder = lower
+
+    def _strip(m, text):
+        return (text[:m.start()] + " " + text[m.end():]).strip()
+
+    company_m = re.search(r"(?:where\s+)?company\s*(?:name)?\s*(?:is|=|:)\s*([a-z0-9&'’\.\-\s]{2,40}?)(?:\?|$|,|\band\b)", remainder)
+    if company_m and company_m.group(1).strip():
+        filters['company'] = company_m.group(1).strip()
+        remainder = _strip(company_m, remainder)
+
+    phone_m = re.search(r'(?:where\s+)?(?:phone|mobile|number)\s*(?:is|=|:)\s*([\d\s\-\+]{7,})', remainder)
+    if phone_m and phone_m.group(1).strip():
+        filters['phone'] = re.sub(r'\D', '', phone_m.group(1))
+        remainder = _strip(phone_m, remainder)
+
+    email_m = re.search(r'(?:where\s+)?(?:email|mail)\s*(?:is|=|:)\s*([\w\.\-]+@[\w\.\-]+)', remainder)
+    if email_m and email_m.group(1).strip():
+        filters['email'] = email_m.group(1).strip()
+        remainder = _strip(email_m, remainder)
+
+    remainder = re.sub(r'\bwhere\b', ' ', remainder).strip()
+    remainder = re.sub(r'\s+', ' ', remainder).strip()
+    return filters, remainder
+
+
+def apply_filters(all_items, filters):
+    """Sequentially narrow all_items by every filter present (AND logic)."""
+    items = all_items
+    if filters.get('company'):
+        items = find_by_company(filters['company'], items)
+    if filters.get('phone'):
+        items = find_by_phone(filters['phone'], items)
+    if filters.get('email'):
+        items = find_by_email(filters['email'], items)
+    return items
+
+
+def describe_filters(filters):
+    parts = []
+    if filters.get('company'):
+        parts.append(f"company \"{filters['company']}\"")
+    if filters.get('phone'):
+        parts.append(f"phone \"{filters['phone']}\"")
+    if filters.get('email'):
+        parts.append(f"email \"{filters['email']}\"")
+    return " and ".join(parts)
+
 # ─── Action mapper ────────────────────────────────────────────────────────────
 def action_for_type(typ: str) -> str:
     return {"contact": "SEARCH_CONTACT", "lead": "SEARCH_LEAD",
@@ -287,6 +367,7 @@ ORDINAL_MAP = {
     "third": 2, "3rd": 2, "teesra": 2, "teesre": 2, "teesri": 2, "teen": 2, "3": 2,
     "fourth": 3, "4th": 3, "chautha": 3, "4": 3,
     "fifth": 4, "5th": 4, "paanchwa": 4, "5": 4,
+    "last": -1, "aakhri": -1, "akhri": -1, "final": -1,
 }
 
 
@@ -385,6 +466,14 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
             elif pending == "budget":
                 b = get_budget_display(item)
                 return ChatResponse(reply=f"{get_name(item)}'s budget is **{b}**.", action="TALK")
+            elif pending == "call":
+                phone = get_phone(item)
+                name = get_name(item)
+                if phone:
+                    sessions.setdefault(user_id, {})["last_call_made"] = {"name": name, "phone": phone}
+                    return ChatResponse(reply=f"📞 Calling {name} at {phone}...",
+                                        action="MAKE_CALL", data={"phone": phone, "name": name})
+                return ChatResponse(reply=f"{name} has no phone number saved.", action="TALK")
             else:
                 # Default: full detail card
                 details = get_full_details_text(item, typ)
@@ -430,14 +519,22 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
 
     # ── 0. "show all" / "list all" ────────────────────────────────────────────
     if re.search(r"\b(show all|list all|sab dikhao|all results|sabhi)\b", lower):
+        show_filters, _ = extract_where_filters(lower)
         for typ, lst in search_results.items():
             if lst:
-                return ChatResponse(
-                    reply=f"Showing all {len(lst)} {typ}(s):",
-                    action=action_for_type(typ),
-                    items=lst,
-                    item_type=typ,
-                )
+                items_to_show = lst
+                if show_filters:
+                    narrowed = [i for _, i in apply_filters([(typ, it) for it in lst], show_filters)]
+                    items_to_show = narrowed
+                if items_to_show:
+                    return ChatResponse(
+                        reply=f"Showing all {len(items_to_show)} {typ}(s):",
+                        action=action_for_type(typ),
+                        items=items_to_show,
+                        item_type=typ,
+                    )
+        if show_filters:
+            return ChatResponse(reply=f"No record found matching {describe_filters(show_filters)}.", action="TALK")
 
     # ── 1. Find by phone number ───────────────────────────────────────────────
     # e.g. "give the contact where phone is 6394855865"
@@ -486,6 +583,21 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                 choices=disambig_choices,
             )
         return ChatResponse(reply=f"No record found with email **{email_q}**.", action="TALK")
+
+    # ── 2.5 Narrow by 'where company/phone/email is X' before name lookups ────
+    # This lets compound queries like "budget of saurabh where company is nits"
+    # or "details of saurabh where phone is 987..." narrow the candidate pool
+    # BEFORE we try to match the name, instead of matching against all records.
+    where_filters, filtered_lower = extract_where_filters(lower)
+    if where_filters:
+        narrowed = apply_filters(all_items, where_filters)
+        if not narrowed:
+            return ChatResponse(
+                reply=f"No record found matching {describe_filters(where_filters)}.",
+                action="TALK",
+            )
+        all_items = narrowed
+        lower = filtered_lower or lower
 
     # ── 3. Detail by ID ───────────────────────────────────────────────────────
     id_match = re.search(r'\b(?:id\s*[:#]?\s*|lead\s+id\s*|deal\s+id\s*|company\s+id\s*)(\d+)\b', lower)
@@ -541,7 +653,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
 
     # ── 5. "details" / "detail of <name>" ─────────────────────────────────────
     if re.match(r'^details?$', lower.strip()):
-        for typ, lst in search_results.items():
+        for typ, lst in group_by_type(all_items).items():
             if lst:
                 return ChatResponse(
                     reply=f"Here are all {len(lst)} {typ}(s):",
@@ -584,7 +696,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                         action="TALK",
                         choices=disambig_choices,
                     )
-        for typ, lst in search_results.items():
+        for typ, lst in group_by_type(all_items).items():
             if lst:
                 details_lines = []
                 for item in lst[:5]:
@@ -732,9 +844,15 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
         if field_name_match:
             name_q = field_name_match.group(1).strip()
             matches = find_by_name(name_q, all_items)
-            if matches:
+            if excl_name:
+                matches = [(t, i) for t, i in matches if not fuzzy_match(excl_name, get_name(i))]
+            if len(matches) == 1:
                 _, target_item = matches[0]
-        if not target_item and all_items:
+            elif len(matches) > 1:
+                choices = build_disambig_choices(matches)
+                return ChatResponse(reply=f"Found **{len(matches)}** records for \"{name_q}\". Which one?",
+                                    action="TALK", choices=choices)
+        if not target_item and len(all_items) == 1:
             _, target_item = all_items[0]
 
         if target_item:
@@ -772,7 +890,7 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
 
     # ── 11. Count query ────────────────────────────────────────────────────────
     if re.search(r'\b(kitne|how many|count|total)\b', lower):
-        parts = [f"{len(lst)} {typ}(s)" for typ, lst in search_results.items()]
+        parts = [f"{len(lst)} {typ}(s)" for typ, lst in group_by_type(all_items).items()]
         return ChatResponse(reply="I have: " + ", ".join(parts) + " in memory.", action="TALK")
 
     # ── 12. Generic name typed → show full detail card ─────────────────────────
@@ -815,6 +933,20 @@ def handle_call_from_stored_results(user_msg: str, user_id: str, sessions: dict)
 
     all_items, _ = all_items_from_session(user_id, sessions)
 
+    # ── Narrow by 'where company/phone/email is X' BEFORE trying to parse a
+    # name — this fixes "call saurabh where company is nits" always calling
+    # the first/last record instead of the one actually matching the filter.
+    where_filters, filtered_lower = extract_where_filters(lower)
+    if where_filters:
+        narrowed = apply_filters(all_items, where_filters)
+        if not narrowed:
+            return ChatResponse(
+                reply=f"No record found matching {describe_filters(where_filters)} to call.",
+                action="TALK",
+            )
+        all_items = narrowed
+        lower = filtered_lower or lower
+
     # ── PRIORITY 0: an email address is explicitly given in the call request,
     # e.g. "call saurabh with email saurabh123mahi@gmail.com" — match on that
     # email directly instead of trying (and possibly failing) to parse a name.
@@ -833,6 +965,7 @@ def handle_call_from_stored_results(user_msg: str, user_id: str, sessions: dict)
             return ChatResponse(reply=f"{name} has no phone number saved.", action="TALK")
         elif len(matches) > 1:
             choices = [f"{get_name(i)} — {get_phone(i) or 'no phone'}" for _, i in matches[:5]]
+            sessions.setdefault(user_id, {})["pending_field_intent"] = "call"
             return ChatResponse(reply="Multiple records share that email. Which one should I call?",
                                 action="TALK", choices=choices)
         else:
@@ -872,10 +1005,21 @@ def handle_call_from_stored_results(user_msg: str, user_id: str, sessions: dict)
                 return ChatResponse(reply=f"No phone number for {name}.", action="TALK")
             elif len(matches) > 1:
                 choices = [f"{get_name(i)} — {get_phone(i) or 'no phone'}" for _, i in matches[:5]]
+                sessions.setdefault(user_id, {})["pending_field_intent"] = "call"
                 return ChatResponse(reply=f"Multiple matches for '{name_q}'. Which one to call?",
                                     action="TALK", choices=choices)
 
     if all_items:
+        # If a where-filter was applied and it still leaves multiple records
+        # (and the user didn't name anyone or use an ordinal), ask rather than
+        # guessing — this is what previously always called the first record.
+        if where_filters and len(all_items) > 1:
+            choices = build_disambig_choices(all_items)
+            sessions.setdefault(user_id, {})["pending_field_intent"] = "call"
+            return ChatResponse(
+                reply=f"I found **{len(all_items)}** records matching {describe_filters(where_filters)}. Which one should I call?",
+                action="TALK", choices=choices,
+            )
         last_shown = sessions.get(user_id, {}).get("last_shown_item")
         if last_shown:
             typ, item = last_shown
