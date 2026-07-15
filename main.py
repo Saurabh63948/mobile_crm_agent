@@ -95,6 +95,10 @@ def get_company(item):
 def get_stage(item):
     return item.get("stage_name") or item.get("pipeline_stage") or ""
 
+def get_owner(item):
+    return (item.get("lead_owner_name") or item.get("contact_owner_name") or
+            item.get("deal_owner_name") or item.get("owner_name") or "")
+
 def get_id(item):
     return str(item.get("lead_id") or item.get("deal_id") or item.get("company_id") or item.get("id") or "—")
 
@@ -226,7 +230,7 @@ def find_by_phone(phone_query: str, all_items):
     matches = []
     for typ, item in all_items:
         p = re.sub(r'\D', '', get_phone(item))
-        if clean in p or p in clean:
+        if p and (clean in p or p in clean):
             matches.append((typ, item))
     return matches
 
@@ -255,7 +259,7 @@ def find_by_email(email_query: str, all_items):
     matches = []
     for typ, item in all_items:
         e = get_email(item).lower()
-        if eq and (eq in e or e in eq):
+        if eq and e and (eq in e or e in eq):
             matches.append((typ, item))
     return matches
 
@@ -265,7 +269,29 @@ def find_by_company(company_query: str, all_items):
     matches = []
     for typ, item in all_items:
         c = (get_company(item) or "").lower()
-        if cq and (cq in c or c in cq):
+        if cq and c and (cq in c or c in cq):
+            matches.append((typ, item))
+    return matches
+
+def find_by_stage(stage_query: str, all_items):
+    """Find items whose stage matches (case-insensitive, substring). Works for
+    both leads and deals since get_stage() reads stage_name/pipeline_stage."""
+    sq = stage_query.lower().strip()
+    matches = []
+    for typ, item in all_items:
+        s = (get_stage(item) or "").lower()
+        if sq and s and (sq in s or s in sq):
+            matches.append((typ, item))
+    return matches
+
+def find_by_owner(owner_query: str, all_items):
+    """Find items whose owner matches (case-insensitive, substring). Works for
+    leads, deals, and contacts since get_owner() reads all owner field variants."""
+    oq = owner_query.lower().strip()
+    matches = []
+    for typ, item in all_items:
+        o = (get_owner(item) or "").lower()
+        if oq and o and (oq in o or o in oq):
             matches.append((typ, item))
     return matches
 
@@ -276,10 +302,11 @@ def find_by_company(company_query: str, all_items):
 # "call saurabh where company is nits", "budget of saurabh where phone is 987...".
 def extract_where_filters(lower: str):
     """
-    Scan the message for 'where company is X', 'company is X', 'where phone
-    is X', 'where email is X' clauses. Returns (filters_dict, remainder_text)
-    where remainder_text has those clauses stripped out, so the rest of the
-    message can still be parsed cleanly for a name / action.
+    Scan the message for 'where company is X', 'company is X', 'where stage is X',
+    'in X stage', 'where owner is X', 'where phone is X', 'where email is X'
+    clauses. Returns (filters_dict, remainder_text) where remainder_text has
+    those clauses stripped out, so the rest of the message can still be parsed
+    cleanly for a name / action.
     """
     filters = {}
     remainder = lower
@@ -292,6 +319,20 @@ def extract_where_filters(lower: str):
         filters['company'] = company_m.group(1).strip()
         remainder = _strip(company_m, remainder)
 
+    # Stage: "where stage is X" / "stage is X" OR "in X stage" / "which is in X stage"
+    stage_m = re.search(r'(?:where\s+)?stage\s*(?:name)?\s*(?:is|=|:)\s*([a-z0-9\s\-]{2,40}?)(?:\?|$|,|\band\b)', remainder)
+    if not stage_m:
+        stage_m = re.search(r'(?:which\s+is\s+)?\bin\s+([a-z0-9\s\-]{2,30}?)\s+stage\b', remainder)
+    if stage_m and stage_m.group(1).strip():
+        filters['stage'] = stage_m.group(1).strip()
+        remainder = _strip(stage_m, remainder)
+
+    # Owner: "where owner is X" / "owner name is X" / "contact owner is X"
+    owner_m = re.search(r'(?:where\s+)?(?:contact\s+owner|deal\s+owner|lead\s+owner|owner)\s*(?:name)?\s*(?:is|=|:)\s*([a-z\s\.]{2,40}?)(?:\?|$|,|\band\b)', remainder)
+    if owner_m and owner_m.group(1).strip():
+        filters['owner'] = owner_m.group(1).strip()
+        remainder = _strip(owner_m, remainder)
+
     phone_m = re.search(r'(?:where\s+)?(?:phone|mobile|number)\s*(?:is|=|:)\s*([\d\s\-\+]{7,})', remainder)
     if phone_m and phone_m.group(1).strip():
         filters['phone'] = re.sub(r'\D', '', phone_m.group(1))
@@ -302,7 +343,7 @@ def extract_where_filters(lower: str):
         filters['email'] = email_m.group(1).strip()
         remainder = _strip(email_m, remainder)
 
-    remainder = re.sub(r'\bwhere\b', ' ', remainder).strip()
+    remainder = re.sub(r'\b(where|which)\b', ' ', remainder).strip()
     remainder = re.sub(r'\s+', ' ', remainder).strip()
     return filters, remainder
 
@@ -312,6 +353,10 @@ def apply_filters(all_items, filters):
     items = all_items
     if filters.get('company'):
         items = find_by_company(filters['company'], items)
+    if filters.get('stage'):
+        items = find_by_stage(filters['stage'], items)
+    if filters.get('owner'):
+        items = find_by_owner(filters['owner'], items)
     if filters.get('phone'):
         items = find_by_phone(filters['phone'], items)
     if filters.get('email'):
@@ -323,6 +368,10 @@ def describe_filters(filters):
     parts = []
     if filters.get('company'):
         parts.append(f"company \"{filters['company']}\"")
+    if filters.get('stage'):
+        parts.append(f"stage \"{filters['stage']}\"")
+    if filters.get('owner'):
+        parts.append(f"owner \"{filters['owner']}\"")
     if filters.get('phone'):
         parts.append(f"phone \"{filters['phone']}\"")
     if filters.get('email'):
@@ -698,14 +747,25 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                     )
         for typ, lst in group_by_type(all_items).items():
             if lst:
-                details_lines = []
-                for item in lst[:5]:
-                    details_lines.append(get_full_details_text(item, typ))
+                if len(lst) == 1:
+                    item = lst[0]
+                    details = get_full_details_text(item, typ)
+                    return ChatResponse(
+                        reply=f"Here are full details for {get_name(item)}:\n{details}",
+                        action=action_for_type(typ),
+                        items=[item],
+                        item_type=typ,
+                    )
+                # Multiple records survived the filter (e.g. same company/stage/
+                # owner shared by several records) — show cards and ask, don't
+                # dump every record's full text at once.
+                filter_note = f" matching {describe_filters(where_filters)}" if where_filters else ""
                 return ChatResponse(
-                    reply=f"Here are full details for {len(lst)} {typ}(s):\n\n" + "\n\n---\n\n".join(details_lines),
+                    reply=f"Found **{len(lst)}** {typ}(s){filter_note}. Which one do you mean?",
                     action=action_for_type(typ),
                     items=lst[:10],
                     item_type=typ,
+                    choices=build_disambig_choices([(typ, i) for i in lst]),
                 )
 
     # ── 6. Email of <name> ────────────────────────────────────────────────────
@@ -920,6 +980,32 @@ def answer_from_search_results(user_msg: str, user_id: str, sessions: dict) -> O
                 reply=f"Found **{len(matches)}** records named \"{lower.strip()}\". Which one?",
                 action="TALK",
                 choices=disambig_choices,
+            )
+
+    # ── 13. Filter applied but no specific field/action requested ─────────────
+    # e.g. "give me all deal which is in progress stage" — no name, no
+    # email/phone/budget/details keyword, just a filter. Show the matching
+    # records instead of falling through to the generic memory summary.
+    if where_filters:
+        grouped = group_by_type(all_items)
+        for typ, lst in grouped.items():
+            if not lst:
+                continue
+            if len(lst) == 1:
+                item = lst[0]
+                details = get_full_details_text(item, typ)
+                return ChatResponse(
+                    reply=f"Found 1 {typ} matching {describe_filters(where_filters)}:\n{details}",
+                    action=action_for_type(typ),
+                    items=[item],
+                    item_type=typ,
+                )
+            return ChatResponse(
+                reply=f"Found **{len(lst)}** {typ}(s) matching {describe_filters(where_filters)}. Which one do you mean?",
+                action=action_for_type(typ),
+                items=lst[:10],
+                item_type=typ,
+                choices=build_disambig_choices([(typ, i) for i in lst]),
             )
 
     return None
